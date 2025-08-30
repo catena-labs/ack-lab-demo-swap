@@ -16,13 +16,13 @@ const FALLBACK_SOL_PRICE = 150
 const pythClient = new HermesClient("https://hermes.pyth.network", {})
 
 const swapServiceSdk = new AckLabSdk({
-  baseUrl: "https://api.ack-lab.com",
+  baseUrl: process.env.ACK_LAB_BASE_URL ?? "https://api.ack-lab.com",
   clientId: process.env.CLIENT_ID_SWAP_SERVICE || '',
   clientSecret: process.env.CLIENT_SECRET_SWAP_SERVICE || ''
 })
 
 const swapUserSdk = new AckLabSdk({
-  baseUrl: "https://api.ack-lab.com",
+  baseUrl: process.env.ACK_LAB_BASE_URL ?? "https://api.ack-lab.com",
   clientId: process.env.CLIENT_ID_SWAP_USER || '',
   clientSecret: process.env.CLIENT_SECRET_SWAP_USER || ''
 })
@@ -30,7 +30,7 @@ const swapUserSdk = new AckLabSdk({
 // ==================== Types & Storage ====================
 interface PendingSwap {
   usdcAmount: number
-  paymentToken: string
+  paymentRequestUrl: string
   solAmount: number
   exchangeRate: number
 }
@@ -44,13 +44,13 @@ const SWAP_SERVICE_SYSTEM_PROMPT = `You are a swap agent that can exchange USDC 
 When asked to swap USDC for SOL:
 1. First use the createSwapRequest tool to check the exchange rate and generate a payment request
 2. Return the payment token in a STRUCTURED format like this:
-   
-   <payment_token>
-   [INSERT_EXACT_PAYMENT_TOKEN_HERE]
-   </payment_token>
-   
+
+   <payment_request_url>
+   [INSERT_EXACT_PAYMENT_REQUEST_URL_HERE]
+   </payment_request_url>
+
 3. Tell the user the exchange rate and how much SOL they will receive
-4. Once they confirm payment with a payment receipt (JWT string), use the executeSwap tool with that receipt. NO need to ask them for their SOL address if they already provided it.
+4. Once they confirm payment with a payment receipt (A URL), use the executeSwap tool with that receipt. NO need to ask them for their SOL address if they already provided it.
 
 CRITICAL PAYMENT PROCESSING RULES:
 - You MUST process payments for the EXACT amount requested - never partial amounts
@@ -62,12 +62,12 @@ CRITICAL PAYMENT PROCESSING RULES:
   b) Request a smaller swap amount from the beginning
 - You are like a merchant terminal - either the full amount goes through or the transaction is declined
 
-IMPORTANT TECHNICAL DETAILS: 
-- ALWAYS wrap the payment token between <payment_token> and </payment_token> markers
-- The payment receipt you receive should also be in a structured format (between markers)
+IMPORTANT TECHNICAL DETAILS:
+- ALWAYS wrap the payment token between <payment_request_url> and </payment_request_url> markers
+- The payment receipt URL you receive should also be in a structured format (between markers)
 - Extract the ENTIRE content between the markers, including all characters
-- The payment receipt is a JWT that contains the payment token and other payment details
-- The payment amount should be in cents (100 USDC = 10000 cents)
+- The payment receipt is a URL that contains the payment token and other payment details
+- The payment amount should be in cents (100 USD = 10000 cents)
 - Show the exchange rate clearly to the user
 
 For any requests that are not about swapping USDC to SOL, say 'I can only swap USDC for SOL'.`
@@ -80,17 +80,17 @@ The Swap Service will:
 3. Execute the swap and send you SOL after payment
 
 When you receive a payment request:
-1. Look for the payment token between <payment_token> and </payment_token> markers
-2. Extract the ENTIRE content between these markers (it will be a long JWT string)
-3. Use the executePayment tool with that EXACT paymentToken
+1. Look for the payment request URL between <payment_request_url> and </payment_request_url> markers
+2. Extract the ENTIRE content between these markers
+3. Use the executePayment tool with that EXACT paymentRequestUrl
 4. After successful payment, send the receipt back in a STRUCTURED format:
-   
-   Payment completed successfully. 
-   
-   <payment_receipt>
-   [INSERT_FULL_RECEIPT_JWT_HERE]
-   </payment_receipt>
-   
+
+   Payment completed successfully.
+
+   <receipt_url>
+   [INSERT_FULL_RECEIPT_URL_HERE]
+   </receipt_url>
+
    Please proceed with sending SOL to 7VQo3HWesNfBys5VXJF3NcE5JCBsRs25pAoBxD5MJYGp
 
 Your Solana address is: 7VQo3HWesNfBys5VXJF3NcE5JCBsRs25pAoBxD5MJYGp
@@ -105,10 +105,9 @@ CRITICAL PAYMENT BEHAVIOR RULES:
 - Think of this like using a credit card - if the full amount is declined, you don't automatically try a smaller charge
 
 IMPORTANT TECHNICAL DETAILS: 
-- ALWAYS extract the payment token from between the <payment_token> and </payment_token> markers
-- ALWAYS send the receipt between <payment_receipt> and </payment_receipt> markers
-- Include EVERY character of the tokens/receipts - they are long JWT strings
-- The payment receipt contains the payment token and proof of payment`
+- ALWAYS extract the payment request URL from between the <payment_request_url> and </payment_request_url> markers
+- ALWAYS send the receipt between <receipt_url> and </receipt_url> markers
+- The receipt contains the payment token and proof of payment`
 
 // ==================== Price Oracle Functions ====================
 async function getCurrentExchangeRate(): Promise<number> {
@@ -222,35 +221,41 @@ async function runSwapService(message: string) {
           const exchangeRate = await getCurrentExchangeRate()
           const solAmount = usdcAmount / exchangeRate
           const paymentUnits = usdcAmount * 100
-          
-          const { paymentToken } = await swapServiceSdk.createPaymentRequest(
+
+          const { url: paymentRequestUrl, paymentToken } = await swapServiceSdk.createPaymentRequest(
             paymentUnits,
             { description: `Swap ${usdcAmount} USDC for ${solAmount.toFixed(6)} SOL` }
           )
-          
+
+          if (!paymentRequestUrl) {
+            return {
+              error: 'Failed to create payment request, no URL returned'
+            }
+          }
+
           logger.transaction('Payment token generated', {
-            'Token': paymentToken,
+            paymentRequestUrl,
             'Exchange rate': `${exchangeRate} USDC/SOL`,
             'Expected SOL': `${solAmount.toFixed(6)} SOL`
           })
-          
+
           logJwtIfEnabled(paymentToken, 'Decoded payment token JWT payload')
-          
-          pendingSwaps.set(paymentToken, { 
-            usdcAmount, 
-            paymentToken,
+
+          pendingSwaps.set(paymentToken, {
+            usdcAmount,
+            paymentRequestUrl,
             solAmount,
             exchangeRate
           })
           
           return {
-            paymentToken,
+            paymentRequestUrl,
             usdcAmount,
             exchangeRate,
             solAmount: solAmount.toFixed(6),
             paymentRequired: paymentUnits,
             description: `Swap ${usdcAmount} USDC for ~${solAmount.toFixed(6)} SOL at rate ${exchangeRate} USDC/SOL`,
-            instruction: `Please pay ${usdcAmount} USDC (${paymentUnits} units) using this token to proceed with the swap`
+            instruction: `Please pay ${usdcAmount} USDC (${paymentUnits} units) using this paymentRequestUrl to proceed with the swap`
           }
         }
       }),
@@ -258,38 +263,28 @@ async function runSwapService(message: string) {
       executeSwap: tool({
         description: "Execute the swap after payment is confirmed",
         inputSchema: z.object({
-          paymentReceipt: z.string().describe("The payment receipt JWT from the payment"),
+          receiptUrl: z.string().url().describe("The URL of the payment receipt JWT from the payment"),
           recipientAddress: z.string().describe("SOL address to send the swapped SOL").optional()
         }),
-        execute: async ({ paymentReceipt, recipientAddress = "7VQo3HWesNfBys5VXJF3NcE5JCBsRs25pAoBxD5MJYGp" }) => {
-          // Extract receipt from structured format if present
-          let actualReceipt = paymentReceipt
-          const structuredMatch = paymentReceipt.match(/===\s*PAYMENT RECEIPT START\s*===\s*([\s\S]*?)\s*===\s*PAYMENT RECEIPT END\s*===/);
-          
-          if (structuredMatch) {
-            actualReceipt = structuredMatch[1].trim()
-            logger.debug('Extracted receipt from structured format', { length: actualReceipt.length })
-          }
-          
+        execute: async ({ receiptUrl, recipientAddress = "7VQo3HWesNfBys5VXJF3NcE5JCBsRs25pAoBxD5MJYGp", }) => {
+          const paymentReceipt = await fetch(receiptUrl).then((res) =>
+            res.text()
+          )
           // Decode and validate payment receipt
           let paymentToken: string
-          let receiptId: string | undefined
-          
+
           try {
-            const payload = decodeJwtPayload(actualReceipt)
-            
+            const payload = decodeJwtPayload(paymentReceipt)
+
             const extractedToken = payload.vc?.credentialSubject?.paymentToken
             if (!extractedToken) {
               return { error: "Payment token not found in receipt" }
             }
             paymentToken = extractedToken
-            
-            receiptId = payload.jti
-            
+
             if (DECODE_JWT) {
               logger.debug('Decoded payment receipt', {
                 paymentToken: paymentToken.substring(0, 50) + '...',
-                receiptId,
                 subject: payload.sub,
                 issuer: payload.iss
               })
@@ -333,7 +328,6 @@ async function runSwapService(message: string) {
             recipientAddress,
             swapTxHash: swapResult.txHash,
             sendTxHash: sendResult.txHash,
-            receipt: receiptId
           }
         }
       })
@@ -382,29 +376,38 @@ async function runSwapUser(message: string) {
       }),
       
       executePayment: tool({
-        description: "Execute a USDC payment using a payment token received from the Swap Agent",
+        description: "Execute a USDC payment using a payment request URL received from the Swap Agent",
         inputSchema: z.object({
-          paymentToken: z.string().describe("The exact payment token received from the Swap Agent")
+          paymentRequestUrl: z.string().describe("The URL of the payment request token received from the Swap Agent"),
         }),
-        execute: async ({ paymentToken }) => {
+        execute: async ({ paymentRequestUrl }) => {
           logger.transaction('Executing USDC payment', {
-            'Token length': paymentToken.length,
-            'Token': paymentToken.length > 100 ? paymentToken.substring(0, 100) + '...' : paymentToken
+            paymentRequestUrl,
           })
           
           try {
+            const paymentToken = await fetch(paymentRequestUrl).then((res) =>
+              res.text()
+            )
+
             logJwtIfEnabled(paymentToken, 'Payment token JWT payload (before execution)')
-            
+
             const result = await swapUserSdk.executePayment(paymentToken)
             const receiptJwt = result.receipt
-            
-            logger.success('Payment successful!', `Receipt ID: ${receiptJwt}`)
+            const receiptUrl = result.url
+
+            if (!receiptUrl) {
+              return {
+                error: 'Failed to execute payment, no receipt URL returned',
+              }
+            }
+
+            logger.success('Payment successful!', `Receipt ID: ${receiptUrl}`)
             logJwtIfEnabled(receiptJwt, 'Payment receipt JWT payload')
-            
+
             return {
               success: true,
-              receipt: receiptJwt,
-              receiptId: receiptJwt,
+              receiptUrl,
               amount: 10000, // Default for demo
               usdcPaid: 100,
               message: "USDC payment completed successfully"

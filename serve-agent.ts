@@ -195,14 +195,12 @@ export function serveAuthedAgent({
     async (c): Promise<TypedResponse<{ jwt: JwtString }>> => {
       const { jwt } = c.req.valid("json")
 
-      logger.incoming('JWT Request', jwt)
       logJwtPayload(jwt, 'incoming', decodeJwt)
 
       try {
         const result = await agentHandler(jwt)
         
         logJwtPayload(result?.jwt, 'outgoing', decodeJwt)
-        logger.outgoing('JWT Response', result?.jwt || 'Sent JWT response')
 
         return c.json(result)
       } catch (error) {
