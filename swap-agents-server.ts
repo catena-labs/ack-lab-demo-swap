@@ -81,9 +81,8 @@ The Swap Service will:
 
 When you receive a payment request:
 1. Look for the payment request URL between <payment_request_url> and </payment_request_url> markers
-2. Extract the ENTIRE content between these markers
-3. Use the executePayment tool with that EXACT paymentRequestUrl
-4. After successful payment, send the receipt back in a STRUCTURED format:
+2. Use the executePayment tool with that EXACT paymentRequestUrl
+3. After successful payment, call the swap service with the receipt URL in a STRUCTURED format:
 
    Payment completed successfully.
 
@@ -221,11 +220,13 @@ async function runSwapService(message: string) {
           const exchangeRate = await getCurrentExchangeRate()
           const solAmount = usdcAmount / exchangeRate
           const paymentUnits = usdcAmount * 100
+          const paymentRequestId = crypto.randomUUID()
 
-          const { url: paymentRequestUrl, paymentRequestToken } = await swapServiceSdk.createPaymentRequest(
-            paymentUnits,
-            { description: `Swap ${usdcAmount} USDC for ${solAmount.toFixed(6)} SOL` }
-          )
+          const { url: paymentRequestUrl, paymentRequestToken } = await swapServiceSdk.createPaymentRequest({
+            id: paymentRequestId,
+            amount: paymentUnits,
+            description: `Swap ${usdcAmount} USDC for ${solAmount.toFixed(6)} SOL`
+          })
 
           if (!paymentRequestUrl) {
             return {
@@ -241,7 +242,7 @@ async function runSwapService(message: string) {
 
           logJwtIfEnabled(paymentRequestToken, 'Decoded payment request token JWT payload')
 
-          pendingSwaps.set(paymentRequestToken, {
+          pendingSwaps.set(paymentRequestId, {
             usdcAmount,
             paymentRequestUrl,
             solAmount,
@@ -270,37 +271,21 @@ async function runSwapService(message: string) {
           const paymentReceipt = await fetch(receiptUrl).then((res) =>
             res.text()
           )
-          // Decode and validate payment receipt
-          let paymentRequestToken: string
 
-          try {
-            const payload = decodeJwtPayload(paymentReceipt)
+          const { receipt, paymentRequestId } = await swapServiceSdk.verifyPaymentReceipt(paymentReceipt)
 
-            const extractedToken = payload.vc?.credentialSubject?.paymentRequestToken
-            if (!extractedToken) {
-              return { error: "Payment request token not found in receipt" }
-            }
-            paymentRequestToken = extractedToken
 
-            if (DECODE_JWT) {
-              logger.debug('Decoded payment receipt', {
-                paymentRequestToken: paymentRequestToken.substring(0, 50) + '...',
-                subject: payload.sub,
-                issuer: payload.iss
-              })
-            }
-          } catch (err) {
-            logger.error('Failed to decode payment receipt', String(err))
-            return { error: "Failed to decode payment receipt" }
+          if (DECODE_JWT) {
+            logger.debug('Decoded payment receipt', receipt)
           }
-          
+
           // Validate pending swap
-          const pendingSwap = pendingSwaps.get(paymentRequestToken)
+          const pendingSwap = pendingSwaps.get(paymentRequestId)
           if (!pendingSwap) {
             return { error: "Invalid or expired payment request token" }
           }
           
-          if (completedSwaps.has(paymentRequestToken)) {
+          if (completedSwaps.has(paymentRequestId)) {
             return { error: "This swap has already been executed" }
           }
           
@@ -317,8 +302,8 @@ async function runSwapService(message: string) {
           }
           
           // Mark as completed
-          completedSwaps.add(paymentRequestToken)
-          pendingSwaps.delete(paymentRequestToken)
+          completedSwaps.add(paymentRequestId)
+          pendingSwaps.delete(paymentRequestId)
           
           return {
             success: true,
